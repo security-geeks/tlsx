@@ -93,6 +93,10 @@ type Options struct {
 	Hash string
 	// Jarm calculate jarm fingerprinting with multiple probes
 	Jarm bool
+	// Ja3 calculate ja3 fingerprinting for tls client hello
+	Ja3 bool
+	// Ja3s calculate ja3 fingerprinting for tls server hello
+	Ja3s bool
 	// Cert displays certificate in pem format
 	Cert bool
 
@@ -127,6 +131,8 @@ type Response struct {
 	// Chain is the chain of certificates
 	Chain      []*CertificateResponse `json:"chain,omitempty"`
 	JarmHash   string                 `json:"jarm_hash,omitempty"`
+	Ja3Hash    string                 `json:"ja3_hash,omitempty"`
+	Ja3sHash   string                 `json:"ja3s_hash,omitempty"`
 	ServerName string                 `json:"sni,omitempty"`
 }
 

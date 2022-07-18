@@ -18,6 +18,7 @@ import (
 	"github.com/projectdiscovery/tlsx/pkg/output"
 	"github.com/projectdiscovery/tlsx/pkg/output/stats"
 	"github.com/projectdiscovery/tlsx/pkg/tlsx"
+	"github.com/projectdiscovery/tlsx/pkg/tlsx/Ja3Hash"
 	"github.com/projectdiscovery/tlsx/pkg/tlsx/clients"
 )
 
@@ -27,6 +28,7 @@ type Runner struct {
 	outputWriter output.Writer
 	fastDialer   *fastdialer.Dialer
 	options      *clients.Options
+	pcapHandler  *Ja3Hash.Ja3Handler
 }
 
 // New creates a new runner from provided configuration options
@@ -69,6 +71,13 @@ func New(options *clients.Options) (*Runner, error) {
 	}
 	runner.outputWriter = outputWriter
 
+	if options.Ja3 || options.Ja3s {
+		runner.pcapHandler, err = Ja3Hash.New(options)
+		if err != nil {
+			return nil, errors.Wrap(err, "could not create pcap handle")
+		}
+	}
+
 	return runner, nil
 }
 
@@ -76,6 +85,11 @@ func New(options *clients.Options) (*Runner, error) {
 func (r *Runner) Close() error {
 	_ = r.outputWriter.Close()
 	r.fastDialer.Close()
+	if r.pcapHandler != nil {
+		for _, h := range r.pcapHandler.Handlers {
+			h.Close()
+		}
+	}
 	return nil
 }
 
@@ -94,6 +108,9 @@ func (r *Runner) Execute() error {
 	// Create the worker goroutines for processing
 	inputs := make(chan taskInput, r.options.Concurrency)
 	wg := &sync.WaitGroup{}
+	if r.options.Ja3 || r.options.Ja3s {
+		r.pcapHandler.Handle(r.options)
+	}
 
 	for i := 0; i < r.options.Concurrency; i++ {
 		wg.Add(1)
@@ -135,6 +152,33 @@ func (r *Runner) processInputElementWorker(inputs chan taskInput, wg *sync.WaitG
 			gologger.Warning().Msgf("Could not connect input %s: %s", task.Address(), err)
 		}
 		if response != nil {
+			if r.options.Ja3 {
+				Ja3Hash, found := r.pcapHandler.Store.Get(response.IP + "ja3")
+				if found {
+					response.Ja3Hash = string(Ja3Hash)
+				} else {
+					// TODO: find a solution for this
+					time.Sleep(time.Second * 5)
+					Ja3Hash, found := r.pcapHandler.Store.Get(response.IP + "ja3")
+					if found {
+						response.Ja3Hash = string(Ja3Hash)
+					}
+				}
+			}
+			if r.options.Ja3s {
+				Ja3Hash, found := r.pcapHandler.Store.Get(response.IP + "ja3s")
+				if found {
+					response.Ja3sHash = string(Ja3Hash)
+				} else {
+					// TODO: find a solution for this
+					time.Sleep(time.Second * 5)
+					Ja3Hash, found := r.pcapHandler.Store.Get(response.IP + "ja3s")
+					if found {
+						response.Ja3sHash = string(Ja3Hash)
+					}
+				}
+			}
+
 			if err := r.outputWriter.Write(response); err != nil {
 				gologger.Warning().Msgf("Could not write output %s: %s", task.Address(), err)
 			}
