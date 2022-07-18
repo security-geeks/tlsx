@@ -1,7 +1,6 @@
 package Ja3Hash
 
 import (
-	"fmt"
 	"net"
 	"time"
 
@@ -31,13 +30,10 @@ func New(options *clients.Options) (*Ja3Handler, error) {
 	var filter string
 	switch {
 	case options.Ja3 && options.Ja3s:
-		fmt.Println("[+] Ja3 and Ja3s enabled")
 		filter = "(tcp[((tcp[12] & 0xf0) >>2)] = 0x16) && ((tcp[((tcp[12] & 0xf0) >>2)+5] = 0x02) || (tcp[((tcp[12] & 0xf0) >>2)+5] = 0x01))"
 	case options.Ja3:
-		fmt.Println("[+] Ja3 enabled")
 		filter = "(tcp[((tcp[12] & 0xf0) >>2)] = 0x16) && (tcp[((tcp[12] & 0xf0) >>2)+5] = 0x01)"
 	case options.Ja3s:
-		fmt.Println("[+] Ja3s enabled")
 		filter = "(tcp[((tcp[12] & 0xf0) >>2)] = 0x16) && (tcp[((tcp[12] & 0xf0) >>2)+5] = 0x02)"
 	}
 	handlers := make([]*pcap.Handle, 0)
