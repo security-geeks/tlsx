@@ -7,6 +7,7 @@
 <p align="center">
 <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-_red.svg"></a>
 <a href="https://goreportcard.com/badge/github.com/projectdiscovery/tlsx"><img src="https://goreportcard.com/badge/github.com/projectdiscovery/tlsx"></a>
+<a href="https://pkg.go.dev/github.com/projectdiscovery/tlsx/pkg/tlsx"><img src="https://img.shields.io/badge/go-reference-blue"></a>
 <a href="https://github.com/projectdiscovery/tlsx/releases"><img src="https://img.shields.io/github/release/projectdiscovery/tlsx"></a>
 <a href="https://twitter.com/pdiscoveryio"><img src="https://img.shields.io/twitter/follow/pdiscoveryio.svg?logo=twitter"></a>
 <a href="https://discord.gg/projectdiscovery"><img src="https://img.shields.io/discord/695645237418131507.svg?logo=discord"></a>
@@ -36,13 +37,13 @@ A fast and configurable TLS grabber focused on TLS based **data collection and a
  - Customizable **Cipher / SNI / TLS** selection
  - **JARM/JA3** TLS Fingerprint
  - **TLS Misconfigurations**
- - **HOST, IP, URL** and **CIDR** input
+ - **ASN,CIDR,IP,HOST,** and **URL** input
  - STD **IN/OUT** and **TXT/JSON** output
 
 
 ## Installation
 
-tlsx requires **Go 1.18** to install successfully. To install, just run the below command or download pre-compiled binary from [release page](https://github.com/projectdiscovery/tlsx/releases).
+tlsx requires **Go 1.21** to install successfully. To install, just run the below command or download pre-compiled binary from [release page](https://github.com/projectdiscovery/tlsx/releases).
 
 ```console
 go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest
@@ -57,8 +58,10 @@ tlsx -h
 This will display help for the tool. Here are all the switches it supports.
 
 ```console
+TLSX is a tls data gathering and analysis toolkit.
+
 Usage:
-  ./tlsx [flags]
+  tlsx [flags]
 
 Flags:
 INPUT:
@@ -67,29 +70,35 @@ INPUT:
    -p, -port string[]  target port to connect (default 443)
 
 SCAN-MODE:
-   -sm, -scan-mode string     tls connection mode to use (ctls, ztls, auto) (default "auto")
+   -sm, -scan-mode string     tls connection mode to use (ctls, ztls, openssl, auto) (default "auto")
    -ps, -pre-handshake        enable pre-handshake tls connection (early termination) using ztls
    -sa, -scan-all-ips         scan all ips for a host (default false)
    -iv, -ip-version string[]  ip version to use (4, 6) (default 4)
 
 PROBES:
-   -san                 display subject alternative names
-   -cn                  display subject common names
-   -so                  display subject organization name
-   -tv, -tls-version    display used tls version
-   -cipher              display used cipher
-   -hash string         display certificate fingerprint hashes (md5,sha1,sha256)
-   -jarm                display jarm fingerprint hash
-   -ja3                 display ja3 fingerprint hash (using ztls)
-   -wc, -wildcard-cert  display host with wildcard ssl certificate
-   -tps, -probe-status  display tls probe status
-   -ve, -version-enum   enumerate and display supported tls versions
-   -ce, -cipher-enum    enumerate and display supported cipher
+   -san                     display subject alternative names
+   -cn                      display subject common names
+   -so                      display subject organization name
+   -tv, -tls-version        display used tls version
+   -cipher                  display used cipher
+   -hash string             display certificate fingerprint hashes (md5,sha1,sha256)
+   -jarm                    display jarm fingerprint hash
+   -ja3                     display ja3 fingerprint hash (using ztls)
+   -wc, -wildcard-cert      display host with wildcard ssl certificate
+   -tps, -probe-status      display tls probe status
+   -ve, -version-enum       enumerate and display supported tls versions
+   -ce, -cipher-enum        enumerate and display supported cipher
+   -ct, -cipher-type value  ciphers types to enumerate. possible values: all/secure/insecure/weak (comma-separated) (default all)
+   -ch, -client-hello       include client hello in json output (ztls mode only)
+   -sh, -server-hello       include server hello in json output (ztls mode only)
+   -se, -serial             display certificate serial number
 
 MISCONFIGURATIONS:
    -ex, -expired      display host with host expired certificate
    -ss, -self-signed  display host with self-signed certificate
    -mm, -mismatched   display host with mismatched certificate
+   -re, -revoked      display host with revoked certificate
+   -un, -untrusted    display host with untrusted certificate
 
 CONFIGURATIONS:
    -config string               path to the tlsx configuration file
@@ -97,27 +106,44 @@ CONFIGURATIONS:
    -cc, -cacert string          client certificate authority file
    -ci, -cipher-input string[]  ciphers to use with tls connection
    -sni string[]                tls sni hostname to use
+   -rs, -random-sni             use random sni when empty
+   -rps, -rev-ptr-sni           perform reverse PTR to retrieve SNI from IP
    -min-version string          minimum tls version to accept (ssl30,tls10,tls11,tls12,tls13)
    -max-version string          maximum tls version to accept (ssl30,tls10,tls11,tls12,tls13)
-   -ac, -all-ciphers            send all ciphers as accepted inputs (default true)
    -cert, -certificate          include certificates in json output (PEM format)
    -tc, -tls-chain              include certificates chain in json output
    -vc, -verify-cert            enable verification of server certificate
+   -ob, -openssl-binary string  OpenSSL Binary Path
+   -hf, -hardfail               strategy to use if encountered errors while checking revocation status
 
 OPTIMIZATIONS:
    -c, -concurrency int  number of concurrent threads to process (default 300)
+   -cec, -cipher-concurrency int  cipher enum concurrency for each target (default 10)
    -timeout int          tls connection timeout in seconds (default 5)
-   -retries int          number of retries to perform for failures (default 3)
+   -retry int            number of retries to perform for failures (default 3)
+   -delay string         duration to wait between each connection per thread (eg: 200ms, 1s)
+
+UPDATE:
+   -up, -update                 update tlsx to latest version
+   -duc, -disable-update-check  disable automatic tlsx update check
 
 OUTPUT:
    -o, -output string  file to write output to
-   -j, -json           display json format output
+   -j, -json           display output in jsonline format
+   -dns                display unique hostname from SSL certificate response
    -ro, -resp-only     display tls response only
    -silent             display silent output
    -nc, -no-color      disable colors in cli output
    -v, -verbose        display verbose output
    -version            display project version
+
+DEBUG:
+   -health-check, -hc  run diagnostic check up
 ```
+
+## Using tlsx as library
+
+Examples of using tlsx as library are provided in the [examples](examples/) folder.
 
 ## Running tlsx
 
@@ -126,6 +152,7 @@ OUTPUT:
 **tlsx** requires **ip** to make TLS connection and accept multiple format as listed below:
 
 ```bash
+AS1449 # ASN input
 173.0.84.0/24 # CIDR input
 93.184.216.34 # IP input
 example.com # DNS input
@@ -303,12 +330,12 @@ support.hackerone.com:443 [TLS1.2] [TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256]
 
 # TLS Misconfiguration
 
-### Expired / Self Signed / Mismatched Certificate
+### Expired / Self Signed / Mismatched / Revoked / Untrusted Certificate
 
-A list of host can be provided to tlsx to detect **expired / self-signed / mismatched** certificates.
+A list of host can be provided to tlsx to detect **expired / self-signed / mismatched / revoked / untrusted** certificates.
 
 ```console
-$ tlsx -l hosts.txt -expired -self-signed -mismatched
+$ tlsx -l hosts.txt -expired -self-signed -mismatched -revoked -untrusted
   
 
   _____ _    _____  __
@@ -324,6 +351,8 @@ $ tlsx -l hosts.txt -expired -self-signed -mismatched
 wrong.host.badssl.com:443 [mismatched]
 self-signed.badssl.com:443 [self-signed]
 expired.badssl.com:443 [expired]
+revoked.badssl.com:443 [revoked]
+untrusted-root.badssl.com:443 [untrusted]
 ```
 
 ### [JARM](https://engineering.salesforce.com/easily-identify-malicious-servers-on-the-internet-with-jarm-e095edac525a/) TLS Fingerprint
@@ -397,12 +426,12 @@ echo example.com | tlsx -json -silent | jq .
 
 tlsx provides multiple modes to make TLS Connection -
 
-- `auto` (with fallback support) - default
-- `ctls` (**crypto/tls**)
-- `ztls` (**zcrypto/tls**)
-- `openssl` (conditional build)
+- `auto` (automatic fallback to other modes upon failure) - **default**
+- `ctls` (**[crypto/tls](https://github.com/golang/go/blob/master/src/crypto/tls/tls.go)**)
+- `ztls` (**[zcrypto/tls](https://github.com/zmap/zcrypto)**)
+- `openssl` (**[openssl](https://github.com/openssl/openssl)**)
 
-Some pointers for the specific mode / library is highlighted in [linked discussions](https://github.com/projectdiscovery/tlsx/discussions/2), `auto` mode is supported to ensure the maximum coverage and scans for the hosts running older version of TLS by retrying the connection using `ztls` mode upon any connection error.
+Some pointers for the specific mode / library is highlighted in [linked discussions](https://github.com/projectdiscovery/tlsx/discussions/2), `auto` mode is supported to ensure the maximum coverage and scans for the hosts running older version of TLS by retrying the connection using `ztls` and `openssl` mode upon any connection error.
 
 An example of using `ztls` mode to scan website using old / outdated TLS version.
 
@@ -423,62 +452,13 @@ $ echo tls-v1-0.badssl.com | tlsx -port 1010 -sm ztls
 tls-v1-0.badssl.com:1010
 ```
 
+### OpenSSL
+
+To use the openssl connection mode, you will need to have openssl installed on your system. Most modern systems come with openssl pre-installed, but if it is not present on your system, you can install it manually. You can check if openssl is installed by running the command `openssl version`. If openssl is installed, this command will display the version number.
+
 <table>
 <tr>
 <td>
-
-### OpenSSL
-
-`tlsx` can be built with support for `OpenSSL` for osx and linux systems. The library must be installed with the following commands:
-
-
-**OSX**:
-
-```console
-brew install openssl
-```
-
-**OSX Arm**:
-
-```console
-brew install openssl
-```
-
-```console
-export CGO_LDFLAGS="-L/opt/homebrew/opt/openssl@1.1/lib"
-export CGO_CPPFLAGS="-I/opt/homebrew/opt/openssl@1.1/include"
-```
-
-```console
-go build -tags openssl .
-```
-
-**Linux**:
-
-```console
-apt install openssl
-```
-
-On some linux systems the default configuration is restrictive, and in order to allow more tls coverage the enclosed `assets/openssl.include` should be copied onto the system and the following snippet added to `/etc/ssl/openssl.cnf`:
-
-```
-.include /path/to/openssl.include
-```
-
-Finally the binary must be built with the `openssl` tag:
-
-```console
-go build -tags openssl .
-```
-
-At this point the engine can be used with:
-
-```console
-tlsx -sm openssl -json
-```
-</td>
-</tr>
-</table>
 
 ### Pre-Handshake (Early Termination)
 
@@ -505,9 +485,13 @@ $ tlsx -u example.com -pre-handshake
 example.com:443
 ```
 
-**Note:**
+> **Note**:
 
 > **pre-handshake** mode utilizes `ztls` (**zcrypto/tls**) which also means the support is limited till `TLS v1.2` as `TLS v1.3` is not supported by `ztls` library.
+
+</table>
+</tr>
+</td>
 
 ### TLS Version
 
@@ -519,6 +503,7 @@ The acceptable values for TLS version is specified below.
 - `tls10`
 - `tls11`
 - `tls12`
+- `tls13`
 
 Here is an example using `max-version` to scan for hosts supporting an older version of TLS, i.e **TLS v1.0**
 
@@ -555,7 +540,8 @@ $ tlsx -u example.com -ci cipher_list.txt -cipher
 This program optionally uses:
 
 - [zcrypto](https://github.com/zmap/zcrypto) library from the zmap team.
-- [spacelog](https://github.com/spacemonkeygo/spacelog) for openssl cgo bindings.
+- [cfssl](https://github.com/cloudflare/cfssl) library from the cloudflare team
+- cipher data from [ciphersuite.info](https://ciphersuite.info) for ciphersuite classification
 
 --------
 

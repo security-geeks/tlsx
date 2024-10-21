@@ -6,16 +6,19 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
+	"errors"
 	"net"
 	"os"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/projectdiscovery/fastdialer/fastdialer"
 	"github.com/projectdiscovery/gologger"
-	"github.com/projectdiscovery/iputil"
+	"github.com/projectdiscovery/tlsx/pkg/output/stats"
 	"github.com/projectdiscovery/tlsx/pkg/tlsx/clients"
+	"github.com/projectdiscovery/utils/conn/connpool"
+	errorutil "github.com/projectdiscovery/utils/errors"
+	iputil "github.com/projectdiscovery/utils/ip"
+	stringsutil "github.com/projectdiscovery/utils/strings"
 	"github.com/rs/xid"
 )
 
@@ -54,20 +57,21 @@ func New(options *clients.Options) (*Client, error) {
 		options: options,
 	}
 
-	if options.AllCiphers {
-		c.tlsConfig.CipherSuites = AllCiphers
-	}
 	if len(options.Ciphers) > 0 {
 		if customCiphers, err := toTLSCiphers(options.Ciphers); err != nil {
-			return nil, errors.Wrap(err, "could not get tls ciphers")
+			return nil, errorutil.NewWithTag("ctls", "could not get tls ciphers").Wrap(err)
 		} else {
 			c.tlsConfig.CipherSuites = customCiphers
 		}
+	} else {
+		// unless explicitly specified client should advertise all supported ciphers
+		// Note: Go stdlib by default only advertises a safe/default list of ciphers
+		c.tlsConfig.CipherSuites = AllCiphers
 	}
 	if options.CACertificate != "" {
 		caCert, err := os.ReadFile(options.CACertificate)
 		if err != nil {
-			return nil, errors.Wrap(err, "could not read ca certificate")
+			return nil, errorutil.NewWithTag("ctls", "could not read ca certificate").Wrap(err)
 		}
 		certPool := x509.NewCertPool()
 		if !certPool.AppendCertsFromPEM(caCert) {
@@ -78,7 +82,7 @@ func New(options *clients.Options) (*Client, error) {
 	if options.MinVersion != "" {
 		version, ok := versionStringToTLSVersion[options.MinVersion]
 		if !ok {
-			return nil, fmt.Errorf("invalid min version specified: %s", options.MinVersion)
+			return nil, errorutil.NewWithTag("ctls", "invalid min version specified: %s", options.MinVersion)
 		} else {
 			c.tlsConfig.MinVersion = version
 		}
@@ -86,7 +90,7 @@ func New(options *clients.Options) (*Client, error) {
 	if options.MaxVersion != "" {
 		version, ok := versionStringToTLSVersion[options.MaxVersion]
 		if !ok {
-			return nil, fmt.Errorf("invalid max version specified: %s", options.MaxVersion)
+			return nil, errorutil.NewWithTag("ctls", "invalid max version specified: %s", options.MaxVersion)
 		} else {
 			c.tlsConfig.MaxVersion = version
 		}
@@ -96,10 +100,10 @@ func New(options *clients.Options) (*Client, error) {
 
 // Connect connects to a host and grabs the response data
 func (c *Client) ConnectWithOptions(hostname, ip, port string, options clients.ConnectOptions) (*clients.Response, error) {
-	address := net.JoinHostPort(hostname, port)
-
-	if c.options.ScanAllIPs || len(c.options.IPVersion) > 0 {
-		address = net.JoinHostPort(ip, port)
+	// Get Config based on options
+	config, err := c.getConfig(hostname, ip, port, options)
+	if err != nil {
+		return nil, errorutil.NewWithErr(err).Msgf("failed to connect got cfg error")
 	}
 
 	ctx := context.Background()
@@ -109,69 +113,41 @@ func (c *Client) ConnectWithOptions(hostname, ip, port string, options clients.C
 		defer cancel()
 	}
 
-	rawConn, err := c.dialer.Dial(ctx, "tcp", address)
+	// setup a net conn
+	rawConn, err := clients.GetConn(ctx, hostname, ip, port, c.options)
 	if err != nil {
-		return nil, errors.Wrap(err, "could not dial address")
+		return nil, errorutil.NewWithErr(err).Msgf("failed to setup connection").WithTag("ctls")
 	}
-	if rawConn == nil {
-		return nil, fmt.Errorf("could not connect to %s", address)
-	}
-	var resolvedIP string
-	if !iputil.IsIP(hostname) {
-		resolvedIP = c.dialer.GetDialedIP(hostname)
-		if resolvedIP == "" {
-			resolvedIP = ip
-		}
-	}
+	// defer rawConn.Close() //internally done by conn.Close() so just a placeholder
 
-	config := c.tlsConfig
-	if config.ServerName == "" {
-		c := config.Clone()
-		if options.SNI != "" {
-			c.ServerName = options.SNI
-		} else if iputil.IsIP(hostname) {
-			// using a random sni will return the default server certificate
-			c.ServerName = xid.New().String()
-		} else {
-			c.ServerName = hostname
-		}
-
-		config = c
-	}
-
-	if options.VersionTLS != "" {
-		version, ok := versionStringToTLSVersion[options.VersionTLS]
-		if !ok {
-			return nil, fmt.Errorf("invalid tls version specified: %s", options.VersionTLS)
-		}
-		config.MinVersion = version
-		config.MaxVersion = version
-	}
-
-	if len(options.Ciphers) > 0 {
-		customCiphers, err := toTLSCiphers(options.Ciphers)
-		if err != nil {
-			return nil, errors.Wrap(err, "could not get tls ciphers")
-		}
-		c.tlsConfig.CipherSuites = customCiphers
-	}
+	var clientCertRequired bool
 
 	conn := tls.Client(rawConn, config)
-	if err := conn.HandshakeContext(ctx); err != nil {
-		rawConn.Close()
-		return nil, errors.Wrap(err, "could not do handshake")
+	err = conn.HandshakeContext(ctx)
+	if err != nil {
+		if clients.IsClientCertRequiredError(err) {
+			clientCertRequired = true
+		} else {
+			rawConn.Close()
+			return nil, errorutil.NewWithTag("ctls", "could not do handshake").Wrap(err)
+		}
 	}
 	defer conn.Close()
 
 	connectionState := conn.ConnectionState()
 	if len(connectionState.PeerCertificates) == 0 {
-		return nil, errors.New("no certificates returned by server")
+		return nil, errorutil.New("no certificates returned by server")
 	}
 	tlsVersion := versionToTLSVersionString[connectionState.Version]
 	tlsCipher := tls.CipherSuiteName(connectionState.CipherSuite)
 
 	leafCertificate := connectionState.PeerCertificates[0]
 	certificateChain := connectionState.PeerCertificates[1:]
+
+	resolvedIP, _, err := net.SplitHostPort(rawConn.RemoteAddr().String())
+	if err != nil {
+		return nil, err
+	}
 
 	now := time.Now()
 	response := &clients.Response{
@@ -183,43 +159,86 @@ func (c *Client) ConnectWithOptions(hostname, ip, port string, options clients.C
 		Version:             tlsVersion,
 		Cipher:              tlsCipher,
 		TLSConnection:       "ctls",
-		CertificateResponse: c.convertCertificateToResponse(hostname, leafCertificate),
+		CertificateResponse: clients.Convertx509toResponse(c.options, hostname, leafCertificate, c.options.Cert),
 		ServerName:          config.ServerName,
 	}
+	response.Untrusted = clients.IsUntrustedCA(certificateChain)
 	if c.options.TLSChain {
 		for _, cert := range certificateChain {
-			response.Chain = append(response.Chain, c.convertCertificateToResponse(hostname, cert))
+			response.Chain = append(response.Chain, clients.Convertx509toResponse(c.options, hostname, cert, c.options.Cert))
 		}
+	}
+
+	// crypto/tls allows for completing the handshake without a client certificate being provided even if one is required
+	// and doesn't return an error until the underyling connection is actually used. As a result, we will temporarily
+	// skip setting ClientCertRequired for TLS 1.3 servers since we don't yet know at this stage whether or not
+	// a client certificate is required.
+	if response.Version != "tls13" {
+		response.ClientCertRequired = &clientCertRequired
 	}
 	return response, nil
 }
 
-func (c *Client) convertCertificateToResponse(hostname string, cert *x509.Certificate) *clients.CertificateResponse {
-	response := &clients.CertificateResponse{
-		SubjectAN:    cert.DNSNames,
-		Emails:       cert.EmailAddresses,
-		NotBefore:    cert.NotBefore,
-		NotAfter:     cert.NotAfter,
-		Expired:      clients.IsExpired(cert.NotAfter),
-		SelfSigned:   clients.IsSelfSigned(cert.AuthorityKeyId, cert.SubjectKeyId),
-		MisMatched:   clients.IsMisMatchedCert(hostname, append(cert.DNSNames, cert.Subject.CommonName)),
-		WildCardCert: clients.IsWildCardCert(append(cert.DNSNames, cert.Subject.CommonName)),
-		IssuerCN:     cert.Issuer.CommonName,
-		IssuerOrg:    cert.Issuer.Organization,
-		SubjectCN:    cert.Subject.CommonName,
-		SubjectOrg:   cert.Subject.Organization,
-		FingerprintHash: clients.CertificateResponseFingerprintHash{
-			MD5:    clients.MD5Fingerprint(cert.Raw),
-			SHA1:   clients.SHA1Fingerprint(cert.Raw),
-			SHA256: clients.SHA256Fingerprint(cert.Raw),
-		},
+func (c *Client) EnumerateCiphers(hostname, ip, port string, options clients.ConnectOptions) ([]string, error) {
+	// filter ciphers based on given seclevel
+	toEnumerate := clients.GetCiphersWithLevel(AllCiphersNames, options.CipherLevel...)
+
+	if options.VersionTLS == "tls13" {
+		return nil, errorutil.NewWithTag("ctls", "cipher enum not supported in ctls with tls1.3")
 	}
-	response.IssuerDN = clients.ParseASN1DNSequenceWithZpkixOrDefault(cert.RawIssuer, cert.Issuer.String())
-	response.SubjectDN = clients.ParseASN1DNSequenceWithZpkixOrDefault(cert.RawSubject, cert.Subject.String())
-	if c.options.Cert {
-		response.Certificate = clients.PemEncode(cert.Raw)
+
+	enumeratedCiphers := []string{}
+
+	baseCfg, err := c.getConfig(hostname, ip, port, options)
+	if err != nil {
+		return enumeratedCiphers, errorutil.NewWithErr(err).Msgf("failed to setup cfg")
 	}
-	return response
+	gologger.Debug().Label("ctls").Msgf("Starting cipher enumeration with %v ciphers and version %v", len(toEnumerate), options.VersionTLS)
+
+	// get network address
+	var address string
+	if iputil.IsIP(ip) && (c.options.ScanAllIPs || len(c.options.IPVersion) > 0) {
+		address = net.JoinHostPort(ip, port)
+	} else {
+		address = net.JoinHostPort(hostname, port)
+	}
+
+	threads := c.options.CipherConcurrency
+	if len(toEnumerate) < threads {
+		threads = len(toEnumerate)
+	}
+
+	// setup connection pool
+	pool, err := connpool.NewOneTimePool(context.Background(), address, threads)
+	if err != nil {
+		return enumeratedCiphers, errorutil.NewWithErr(err).Msgf("failed to setup connection pool")
+	}
+	pool.Dialer = c.dialer
+	go func() {
+		if err := pool.Run(); err != nil && !errors.Is(err, context.Canceled) {
+			gologger.Error().Msgf("tlsx: ctls: failed to run connection pool: %v", err)
+		}
+	}()
+	defer pool.Close()
+
+	for _, v := range toEnumerate {
+		// create new baseConn and pass it to tlsclient
+		baseConn, err := pool.Acquire(context.Background())
+		if err != nil {
+			return enumeratedCiphers, errorutil.NewWithErr(err).WithTag("ctls")
+		}
+		stats.IncrementCryptoTLSConnections()
+		baseCfg.CipherSuites = []uint16{tlsCiphers[v]}
+
+		conn := tls.Client(baseConn, baseCfg)
+
+		if err := conn.Handshake(); err == nil {
+			ciphersuite := conn.ConnectionState().CipherSuite
+			enumeratedCiphers = append(enumeratedCiphers, tls.CipherSuiteName(ciphersuite))
+		}
+		_ = conn.Close() // close baseConn internally
+	}
+	return enumeratedCiphers, nil
 }
 
 // SupportedTLSVersions returns the list of standard tls library supported tls versions
@@ -230,4 +249,48 @@ func (c *Client) SupportedTLSVersions() ([]string, error) {
 // SupportedTLSCiphers returns the list of standard tls library supported ciphers
 func (c *Client) SupportedTLSCiphers() ([]string, error) {
 	return AllCiphersNames, nil
+}
+
+// getConfig returns a valid config to be used by client
+func (c *Client) getConfig(hostname, ip, port string, options clients.ConnectOptions) (*tls.Config, error) {
+	// In enum mode return if given options are not supported
+	if options.EnumMode == clients.Version && (options.VersionTLS == "" || !stringsutil.EqualFoldAny(options.VersionTLS, SupportedTlsVersions...)) {
+		// version not supported
+		return nil, errorutil.NewWithTag("ctls", "tlsversion `%v` not supported in ctls", options.VersionTLS)
+	}
+	config := c.tlsConfig
+	if config.ServerName == "" {
+		cfg := config.Clone()
+		if options.SNI != "" {
+			cfg.ServerName = options.SNI
+		} else if iputil.IsIP(hostname) && c.options.RandomForEmptyServerName {
+			// using a random sni will return the default server certificate
+			cfg.ServerName = xid.New().String()
+		} else {
+			cfg.ServerName = hostname
+		}
+
+		config = cfg
+	}
+
+	if options.VersionTLS != "" {
+		version, ok := versionStringToTLSVersion[options.VersionTLS]
+		if !ok {
+			return nil, errorutil.New("invalid tls version specified: %s", options.VersionTLS).WithTag("ctls")
+		}
+		config.MinVersion = version
+		config.MaxVersion = version
+	}
+
+	if len(options.Ciphers) > 0 && options.EnumMode != clients.Cipher {
+		customCiphers, err := toTLSCiphers(options.Ciphers)
+		if err != nil {
+			return nil, errorutil.NewWithTag("ctls", "could not get tls ciphers").Wrap(err)
+		}
+		c.tlsConfig.CipherSuites = customCiphers
+	}
+	if options.EnumMode == clients.Cipher && !stringsutil.EqualFoldAny(options.VersionTLS, SupportedTlsVersions...) {
+		return nil, errorutil.NewWithTag("ctls", "cipher enum with version %v not implemented", options.VersionTLS)
+	}
+	return config, nil
 }

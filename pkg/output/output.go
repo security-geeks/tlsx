@@ -2,6 +2,7 @@ package output
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -9,8 +10,18 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/logrusorgru/aurora"
-	"github.com/pkg/errors"
 	"github.com/projectdiscovery/tlsx/pkg/tlsx/clients"
+	errorutil "github.com/projectdiscovery/utils/errors"
+	mapsutil "github.com/projectdiscovery/utils/maps"
+	"golang.org/x/exp/maps"
+)
+
+var (
+	// when unique domains are displayed with `-dns` flag. tlsx json/struct already
+	// contains unique domains for each certificate
+	// globalDedupe is meant to be used when running in cli mode with multiple inputs
+	// ex: google.com and youtube.com may have same wildcard certificate or some overlapping domains
+	globalDedupe = mapsutil.NewSyncLockMap[string, struct{}]()
 )
 
 // Writer is an interface which writes output to somewhere for katana events.
@@ -39,7 +50,7 @@ func New(options *clients.Options) (Writer, error) {
 	if options.OutputFile != "" {
 		output, err := newFileOutputWriter(options.OutputFile)
 		if err != nil {
-			return nil, errors.Wrap(err, "could not create output file")
+			return nil, errorutil.NewWithErr(err).Msgf("could not create output file")
 		}
 		outputFile = output
 	}
@@ -64,9 +75,13 @@ func (w *StandardWriter) Write(event *clients.Response) error {
 		data, err = w.formatStandard(event)
 	}
 	if err != nil {
-		return errors.Wrap(err, "could not format output")
+		return errorutil.NewWithErr(err).Msgf("could not format output")
 	}
 	data = bytes.TrimSuffix(data, []byte("\n")) // remove last newline
+	if len(data) == 0 {
+		// this happens when -dns flag is used and two domains have same certificate hence deduped
+		return nil
+	}
 
 	w.outputMutex.Lock()
 	defer w.outputMutex.Unlock()
@@ -77,7 +92,7 @@ func (w *StandardWriter) Write(event *clients.Response) error {
 			data = decolorizerRegex.ReplaceAll(data, []byte(""))
 		}
 		if writeErr := w.outputFile.Write(data); writeErr != nil {
-			return errors.Wrap(err, "could not write to output")
+			return errorutil.NewWithErr(err).Msgf("could not write to output")
 		}
 	}
 	return nil
@@ -99,7 +114,28 @@ func (w *StandardWriter) formatJSON(output *clients.Response) ([]byte, error) {
 
 // formatStandard formats the output for standard client formatting
 func (w *StandardWriter) formatStandard(output *clients.Response) ([]byte, error) {
+	if output == nil {
+		return nil, errorutil.New("empty certificate response")
+	}
+
+	if output.CertificateResponse == nil {
+		return nil, errorutil.New("empty leaf certificate")
+	}
+	cert := output.CertificateResponse
 	builder := &bytes.Buffer{}
+
+	if w.options.DisplayDns {
+		for _, hname := range cert.Domains {
+			if _, ok := globalDedupe.Get(hname); ok {
+				continue
+			}
+			_ = globalDedupe.Set(hname, struct{}{})
+			builder.WriteString(hname)
+			builder.WriteString("\n")
+		}
+		outputdata := builder.Bytes()
+		return outputdata, nil
+	}
 
 	if !w.options.RespOnly {
 		builder.WriteString(output.Host)
@@ -113,8 +149,6 @@ func (w *StandardWriter) formatStandard(output *clients.Response) ([]byte, error
 	}
 	outputPrefix := builder.String()
 	builder.Reset()
-
-	cert := output.CertificateResponse
 
 	var names []string
 	if w.options.SAN {
@@ -138,7 +172,7 @@ func (w *StandardWriter) formatStandard(output *clients.Response) ([]byte, error
 		}
 	}
 
-	if !w.options.SAN && !w.options.CN {
+	if !w.options.SAN && !w.options.CN && !w.options.TlsCiphersEnum {
 		builder.WriteString(outputPrefix)
 	}
 	if !output.ProbeStatus {
@@ -186,9 +220,24 @@ func (w *StandardWriter) formatStandard(output *clients.Response) ([]byte, error
 		builder.WriteString(w.aurora.Yellow("mismatched").String())
 		builder.WriteString("]")
 	}
+	if w.options.Revoked && cert.Revoked {
+		builder.WriteString(" [")
+		builder.WriteString(w.aurora.Red("revoked").String())
+		builder.WriteString("]")
+	}
+	if w.options.Untrusted && cert.Untrusted {
+		builder.WriteString(" [")
+		builder.WriteString(w.aurora.Yellow("untrusted").String())
+		builder.WriteString("]")
+	}
 	if w.options.WildcardCertCheck && cert.WildCardCert {
 		builder.WriteString(" [")
 		builder.WriteString(w.aurora.Yellow("wildcard").String())
+		builder.WriteString("]")
+	}
+	if w.options.Serial {
+		builder.WriteString(" [")
+		builder.WriteString(w.aurora.BrightCyan(cert.Serial).String())
 		builder.WriteString("]")
 	}
 	if w.options.Hash != "" {
@@ -221,7 +270,26 @@ func (w *StandardWriter) formatStandard(output *clients.Response) ([]byte, error
 		builder.WriteString("]")
 	}
 
-	if w.options.TlsVersionsEnum {
+	if w.options.Ja3s && output.Ja3sHash != "" {
+		builder.WriteString(" [")
+		builder.WriteString(w.aurora.Magenta(output.Ja3sHash).String())
+		builder.WriteString("]")
+	}
+
+	if w.options.TlsCiphersEnum {
+		for _, v := range output.TlsCiphers {
+			ct := v.Ciphers.ColorCode(w.aurora)
+			all := []string{}
+			all = append(all, ct.Insecure...)
+			all = append(all, ct.Weak...)
+			all = append(all, ct.Secure...)
+			all = append(all, ct.Unknown...)
+			if len(all) > 0 {
+				builder.WriteString(outputPrefix)
+				builder.WriteString(fmt.Sprintf(" [%v] [%v]\n", w.aurora.Magenta(v.Version), strings.Join(all, ",")))
+			}
+		}
+	} else if w.options.TlsVersionsEnum {
 		builder.WriteString(" [")
 		builder.WriteString(w.aurora.Magenta(strings.Join(output.VersionEnum, ",")).String())
 		builder.WriteString("]")
@@ -237,13 +305,7 @@ func uniqueNormalizeCertNames(names []string) []string {
 	unique := make(map[string]struct{})
 	for _, value := range names {
 		replaced := strings.Replace(value, "*.", "", -1)
-		if _, ok := unique[replaced]; !ok {
-			unique[replaced] = struct{}{}
-		}
+		unique[replaced] = struct{}{}
 	}
-	results := make([]string, 0, len(unique))
-	for v := range unique {
-		results = append(results, v)
-	}
-	return results
+	return maps.Keys(unique)
 }
